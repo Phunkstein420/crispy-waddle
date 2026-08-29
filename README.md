@@ -12,6 +12,7 @@ Three honest signal families only:
 | `business_bankruptcy` | `bk_petition_rss` | CM/ECF public RSS XML for `deb`, `nysb`, `nyeb`, `txsb`, `cacb`, `ilnb`, `flsb` |
 | `business_bankruptcy` | `bk_8k` | SEC EDGAR full-text search for 8-K **Item 1.03** (Bankruptcy or Receivership) |
 | `occupancy_distress` | `occupancy_execution` | NYC Open Data commercial marshal executions |
+| `occupancy_distress` | `occupancy_filing` | Franklin County Municipal Clerk official F.E.D. CSVs (`/reports/evictions`) |
 
 Each event is **facts + `source_url` + `collected_at`**. No SSNs, no newspaper body HTML, no PACER docket PDFs.
 
@@ -21,6 +22,7 @@ Each event is **facts + `source_url` + `collected_at`**. No SSNs, no newspaper b
 - Does not scrape or market lease-default letters.
 - Does not scrape FL / TX / GA press portals (`floridapublicnotices.com`, `texaspublicnotices.com`, `georgiapublicnotice.com`). Those rows stay in `GET /v1/sources` as **catalog-only** (`license_required`).
 - Does not scrape NYS WebCivil Local (Cloudflare / no sanctioned bulk path).
+- Does not bulk-download Franklin County Common Pleas Case Information Online (`fcdcfcjs.co.franklin.oh.us`). Ohio occupancy filings come from the Municipal Clerk F.E.D. CSVs only.
 
 ## HTTP API
 

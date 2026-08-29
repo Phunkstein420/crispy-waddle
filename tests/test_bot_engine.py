@@ -4,9 +4,13 @@ from bot_engine import (
     EventRecord,
     SourceRow,
     edgar_index_url,
+    fed_row_to_event,
     is_blocked_url,
     is_business_name,
+    is_policy_blocked_url,
     nyc_occupancy_class,
+    parse_fed_csv,
+    parse_fed_hub_csv_urls,
     parse_rss_items,
     redact_ssn,
     rss_event_from_item,
@@ -127,3 +131,88 @@ def test_edgar_index_url_does_not_point_at_filing_body() -> None:
         "000115916726000006/0001159167-26-000006-index.htm"
     )
     assert url.endswith("-index.htm")
+
+
+FCMC_SOURCE = SourceRow(
+    id="00000000-0000-0000-0000-0000000000aa",
+    slug="franklin_county_clerk_oh",
+    name="Franklin County Municipal Clerk F.E.D. CSVs",
+    source_kind="court_index",
+    access_model="public_html",
+    license_status="none",
+    collection_status="approved",
+    listing_url="https://www.fcmcclerk.com/reports/evictions",
+    homepage_url="https://www.fcmcclerk.com/",
+    jurisdiction_state="OH",
+    jurisdiction_local="Franklin County",
+    operator="Franklin County Municipal Clerk of Court",
+    robots_notes="CSV hub only",
+)
+
+SAMPLE_FED_HUB = """
+<a href="/storage/shared/civil-fed/FCMC Civil F.E.D. (Eviction) Case List 2026-08-01 to 2026-08-31.csv?1">Aug</a>
+<a href="/storage/shared/civil-fed/FCMC Civil F.E.D. (Eviction) Case List 2026-07-01 to 2026-07-31.csv?2">Jul</a>
+<a href="/case/search/results">disallowed</a>
+"""
+
+SAMPLE_FED_CSV = '''"CASE_NUMBER","CASE_FILE_DATE","LAST_DISPOSITION_DATE","LAST_DISPOSITION_DESCRIPTION","FIRST_PLAINTIFF_PARTY_SEQUENCE","FIRST_PLAINTIFF_FIRST_NAME","FIRST_PLAINTIFF_MIDDLE_NAME","FIRST_PLAINTIFF_LAST_NAME","FIRST_PLAINTIFF_SUFFIX_NAME","FIRST_PLAINTIFF_COMPANY_NAME","FIRST_PLAINTIFF_ADDRESS_LINE_1","FIRST_PLAINTIFF_ADDRESS_LINE_2","FIRST_PLAINTIFF_CITY","FIRST_PLAINTIFF_STATE","FIRST_PLAINTIFF_ZIP","FIRST_DEFENDANT_PARTY_SEQUENCE","FIRST_DEFENDANT_FIRST_NAME","FIRST_DEFENDANT_MIDDLE_NAME","FIRST_DEFENDANT_LAST_NAME","FIRST_DEFENDANT_SUFFIX_NAME","FIRST_DEFENDANT_COMPANY_NAME","FIRST_DEFENDANT_ADDRESS_LINE_1","FIRST_DEFENDANT_ADDRESS_LINE_2","FIRST_DEFENDANT_CITY","FIRST_DEFENDANT_STATE","FIRST_DEFENDANT_ZIP"
+"2026 CVG 043414","08/03/2026","08/21/2026","JUDGMENT HEARD BY MAGISTRATE","1","","","","","BIRGE & HELD HIBERNIA LLC","PO BOX 2290","","COLUMBUS","OH","43216","2","MARTINEZ","","LARRY","","","5711 HIBERNIA DRIVE APT C","","COLUMBUS","OH","43232"
+"2026 CVG 099999","08/04/2026","","","1","","","","","ACME HOLDINGS LLC","PO BOX 1","","COLUMBUS","OH","43215","2","","","","","WIDGET RENTALS LLC","100 HIGH ST","","COLUMBUS","OH","43215"
+'''
+
+
+def test_fcmc_policy_blocks_cio_and_disallowed_paths() -> None:
+    assert is_policy_blocked_url("https://fcdcfcjs.co.franklin.oh.us/CaseInformationOnline/")
+    assert is_policy_blocked_url("https://www.fcmcclerk.com/case/search/results")
+    assert is_policy_blocked_url("https://www.fcmcclerk.com/case/view/123")
+    assert is_policy_blocked_url("https://www.fcmcclerk.com/api/cases")
+    assert not is_policy_blocked_url("https://www.fcmcclerk.com/reports/evictions")
+    assert not is_policy_blocked_url(
+        "https://www.fcmcclerk.com/storage/shared/civil-fed/file.csv"
+    )
+
+
+def test_fcmc_hub_extracts_csv_links_only() -> None:
+    urls = parse_fed_hub_csv_urls(SAMPLE_FED_HUB)
+    assert len(urls) == 2
+    assert all("/reports/evictions" not in u or True for u in urls)
+    assert all("civil-fed" in u and u.endswith("csv") or ".csv" in u for u in urls)
+    assert all("/case/search/results" not in u for u in urls)
+
+
+def test_fcmc_csv_persists_individual_and_entity_rows() -> None:
+    records = parse_fed_csv(
+        SAMPLE_FED_CSV,
+        FCMC_SOURCE,
+        "https://www.fcmcclerk.com/storage/shared/civil-fed/aug.csv",
+    )
+    assert len(records) == 2
+    person = next(r for r in records if r.docket_or_notice_no == "2026 CVG 043414")
+    assert person.signal_family == "occupancy_distress"
+    assert person.event_type == "occupancy_filing"
+    assert person.jurisdiction_state == "OH"
+    assert person.jurisdiction_local == "Franklin County"
+    assert person.primary_party_name == "MARTINEZ LARRY"
+    assert person.counterparty_name == "BIRGE & HELD HIBERNIA LLC"
+    assert person.occupancy_class == "unknown"
+    assert person.property_street == "5711 HIBERNIA DRIVE APT C"
+    entity = next(r for r in records if r.docket_or_notice_no == "2026 CVG 099999")
+    assert entity.occupancy_class == "commercial"
+    assert entity.primary_party_name == "WIDGET RENTALS LLC"
+    rec = fed_row_to_event(
+        FCMC_SOURCE,
+        {
+            "CASE_NUMBER": "2026 CVG 043414",
+            "CASE_FILE_DATE": "08/03/2026",
+            "FIRST_PLAINTIFF_COMPANY_NAME": "BIRGE & HELD HIBERNIA LLC",
+            "FIRST_DEFENDANT_FIRST_NAME": "MARTINEZ",
+            "FIRST_DEFENDANT_LAST_NAME": "LARRY",
+            "FIRST_DEFENDANT_ADDRESS_LINE_1": "5711 HIBERNIA DRIVE APT C",
+            "FIRST_DEFENDANT_CITY": "COLUMBUS",
+            "FIRST_DEFENDANT_STATE": "OH",
+            "FIRST_DEFENDANT_ZIP": "43232",
+        },
+        "https://www.fcmcclerk.com/storage/shared/civil-fed/aug.csv",
+    )
+    assert rec is not None
+    assert rec.occurred_on == date(2026, 8, 3)

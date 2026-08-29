@@ -2,16 +2,20 @@
 
 Collects only public, license-free facts for:
   - business_bankruptcy (CM/ECF RSS petitions, EDGAR 8-K Item 1.03)
-  - occupancy_distress (NYC Open Data commercial executions)
+  - occupancy_distress (NYC Open Data commercial executions;
+    Franklin County Municipal Clerk F.E.D. CSVs)
 
 Never: PACER login, docket PDFs, doc1 links, newspaper HTML, SSNs,
-lease-default letters, or license-gated FL/TX/GA press portals.
+lease-default letters, license-gated FL/TX/GA press portals, or bulk
+Common Pleas CIO (fcdcfcjs.co.franklin.oh.us).
 """
 
 from __future__ import annotations
 
 import asyncio
+import csv
 import html
+import io
 import logging
 import os
 import re
@@ -22,7 +26,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from email.utils import parsedate_to_datetime
 from typing import Any, Iterable
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urljoin, urlparse
 from urllib.robotparser import RobotFileParser
 
 import httpx
@@ -36,6 +40,11 @@ COURT_RSS_PATH = "/cgi-bin/rss_outside.pl"
 NYC_DATASET = "6z8x-wfk4"
 NYC_API = f"https://data.cityofnewyork.us/resource/{NYC_DATASET}.json"
 EDGAR_SEARCH = "https://efts.sec.gov/LATEST/search-index"
+FCMC_EVICTIONS_HUB = "https://www.fcmcclerk.com/reports/evictions"
+FCMC_CSV_HREF_RE = re.compile(
+    r"""href=["']([^"']*civil-fed[^"']+\.csv[^"']*)["']""",
+    re.IGNORECASE,
+)
 
 # Paths we will never request (PACER docket/document surfaces).
 PACER_DENY_RE = re.compile(
@@ -69,6 +78,7 @@ HOST_MIN_INTERVAL = {
     "data.cityofnewyork.us": 1.1,
     "efts.sec.gov": 1.0,
     "www.sec.gov": 1.0,
+    "www.fcmcclerk.com": 1.2,
 }
 DEFAULT_MIN_INTERVAL = 8.0
 COLLECTOR_INTERVAL_DEFAULT = 21600
@@ -175,6 +185,23 @@ def is_blocked_url(url: str) -> bool:
     return bool(PACER_DENY_RE.search(url or ""))
 
 
+def is_policy_blocked_url(url: str) -> bool:
+    """Hard denies: PACER docs, Common Pleas CIO bulk, FCMC disallowed paths."""
+    if is_blocked_url(url):
+        return True
+    parsed = urlparse(url)
+    host = (parsed.netloc or "").lower()
+    path = parsed.path or ""
+    if "fcdcfcjs" in host:
+        return True
+    if host == "www.fcmcclerk.com" or host.endswith(".fcmcclerk.com"):
+        if path.startswith("/case/search/results") or path.startswith("/case/view"):
+            return True
+        if path.startswith("/api"):
+            return True
+    return False
+
+
 class RateLimitedFetcher:
     """HTTP GET with robots.txt, host rate limits, and a PACER deny list."""
 
@@ -224,8 +251,8 @@ class RateLimitedFetcher:
             return None
 
     def allowed(self, url: str) -> bool:
-        if is_blocked_url(url):
-            log.info("blocked PACER/document URL (not fetched): %s", urlparse(url).path)
+        if is_policy_blocked_url(url):
+            log.info("blocked URL by collection policy: %s", urlparse(url).path or url)
             return False
         parsed = urlparse(url)
         robots = self._robots_for(parsed.netloc, parsed.scheme or "https")
@@ -288,12 +315,15 @@ def upsert_events(conn: psycopg.Connection, events: Iterable[EventRecord]) -> in
         )
         ON CONFLICT (source_id, source_event_key) DO NOTHING
     """
+    payloads = [event.__dict__.copy() for event in events]
+    if not payloads:
+        return 0
     with conn.cursor() as cur:
-        for event in events:
-            payload = event.__dict__.copy()
-            cur.execute(sql, payload)
-            if cur.rowcount:
-                inserted += 1
+        for i in range(0, len(payloads), 500):
+            chunk = payloads[i : i + 500]
+            cur.executemany(sql, chunk)
+            if cur.rowcount and cur.rowcount > 0:
+                inserted += cur.rowcount
     return inserted
 
 
@@ -577,6 +607,153 @@ def collect_edgar_8k(fetcher: RateLimitedFetcher, source: SourceRow) -> list[Eve
     return events
 
 
+def parse_fed_hub_csv_urls(hub_html: str, hub_url: str = FCMC_EVICTIONS_HUB) -> list[str]:
+    urls: list[str] = []
+    seen: set[str] = set()
+    for raw in FCMC_CSV_HREF_RE.findall(hub_html or ""):
+        href = html.unescape(raw).strip()
+        absolute = urljoin(hub_url, href)
+        parsed = urlparse(absolute)
+        if is_policy_blocked_url(absolute):
+            continue
+        key = parsed.path
+        if key in seen:
+            continue
+        seen.add(key)
+        urls.append(absolute)
+    return urls
+
+
+def parse_mdy(value: str | None) -> date | None:
+    text = (value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, "%m/%d/%Y").date()
+    except ValueError:
+        return None
+
+
+def fcmc_party_name(
+    first: str,
+    middle: str,
+    last: str,
+    suffix: str,
+    company: str,
+) -> str:
+    company_name = redact_ssn((company or "").strip())
+    if company_name:
+        return company_name
+    parts = [
+        redact_ssn((first or "").strip()),
+        redact_ssn((middle or "").strip()),
+        redact_ssn((last or "").strip()),
+        redact_ssn((suffix or "").strip()),
+    ]
+    return " ".join(p for p in parts if p)
+
+
+def fed_row_to_event(source: SourceRow, row: dict[str, str], source_url: str) -> EventRecord | None:
+    case_no = redact_ssn((row.get("CASE_NUMBER") or "").strip())
+    if not case_no:
+        return None
+    defendant = fcmc_party_name(
+        row.get("FIRST_DEFENDANT_FIRST_NAME") or "",
+        row.get("FIRST_DEFENDANT_MIDDLE_NAME") or "",
+        row.get("FIRST_DEFENDANT_LAST_NAME") or "",
+        row.get("FIRST_DEFENDANT_SUFFIX_NAME") or "",
+        row.get("FIRST_DEFENDANT_COMPANY_NAME") or "",
+    )
+    plaintiff = fcmc_party_name(
+        row.get("FIRST_PLAINTIFF_FIRST_NAME") or "",
+        row.get("FIRST_PLAINTIFF_MIDDLE_NAME") or "",
+        row.get("FIRST_PLAINTIFF_LAST_NAME") or "",
+        row.get("FIRST_PLAINTIFF_SUFFIX_NAME") or "",
+        row.get("FIRST_PLAINTIFF_COMPANY_NAME") or "",
+    )
+    if not defendant and not plaintiff:
+        return None
+    primary = defendant or plaintiff
+    entity = is_business_name(defendant) or is_business_name(plaintiff)
+    defendant_entity = is_business_name(defendant)
+    filed = parse_mdy(row.get("CASE_FILE_DATE"))
+    street_parts = [
+        redact_ssn((row.get("FIRST_DEFENDANT_ADDRESS_LINE_1") or "").strip()),
+        redact_ssn((row.get("FIRST_DEFENDANT_ADDRESS_LINE_2") or "").strip()),
+    ]
+    street = " ".join(p for p in street_parts if p) or None
+    city = redact_ssn((row.get("FIRST_DEFENDANT_CITY") or "").strip()) or None
+    postal = redact_ssn((row.get("FIRST_DEFENDANT_ZIP") or "").strip()) or None
+    return EventRecord(
+        source_id=source.id,
+        source_event_key=case_no[:500],
+        source_url=source_url,
+        signal_family="occupancy_distress",
+        event_type="occupancy_filing",
+        occurred_on=filed,
+        published_on=filed,
+        jurisdiction_state="OH",
+        jurisdiction_local="Franklin County",
+        court_or_office="Franklin County Municipal Clerk of Court",
+        docket_or_notice_no=case_no,
+        occupancy_class="commercial" if defendant_entity else "unknown",
+        primary_party_name=primary[:500],
+        primary_party_kind="entity" if is_business_name(primary) else "individual",
+        counterparty_name=(plaintiff[:500] if plaintiff and plaintiff != primary else None),
+        property_street=street,
+        property_city=city,
+        property_county="Franklin",
+        property_state=char2(row.get("FIRST_DEFENDANT_STATE") or "OH"),
+        property_postal_code=postal,
+        is_business=entity,
+        confidence=Decimal("0.84"),
+    )
+
+
+def parse_fed_csv(csv_text: str, source: SourceRow, source_url: str) -> list[EventRecord]:
+    reader = csv.DictReader(io.StringIO(csv_text))
+    events: list[EventRecord] = []
+    for row in reader:
+        record = fed_row_to_event(source, {k: (v or "") for k, v in row.items()}, source_url)
+        if record:
+            events.append(record)
+    return events
+
+
+def collect_fcmc_fed(fetcher: RateLimitedFetcher, source: SourceRow) -> list[EventRecord]:
+    hub = source.listing_url or FCMC_EVICTIONS_HUB
+    if urlparse(hub).path.rstrip("/") != "/reports/evictions":
+        log.info("skip %s: listing_url is not /reports/evictions", source.slug)
+        return []
+    try:
+        hub_html = fetcher.get_text(hub, accept="text/html")
+    except (httpx.HTTPError, PermissionError) as exc:
+        log.warning("FCMC F.E.D. hub fetch failed: %s", exc)
+        return []
+    csv_urls = parse_fed_hub_csv_urls(hub_html, hub)
+    if not csv_urls:
+        log.warning(
+            "FCMC hub listed no CSVs; not falling back to /case/search/results (robots Disallow)"
+        )
+        return []
+    events: list[EventRecord] = []
+    seen_keys: set[str] = set()
+    for csv_url in csv_urls:
+        if is_policy_blocked_url(csv_url):
+            continue
+        try:
+            csv_text = fetcher.get_text(csv_url, accept="text/csv, text/plain, */*")
+        except (httpx.HTTPError, PermissionError) as exc:
+            log.warning("FCMC CSV fetch failed for %s: %s", csv_url, exc)
+            continue
+        for record in parse_fed_csv(csv_text, source, csv_url.split("?")[0]):
+            if record.source_event_key in seen_keys:
+                continue
+            seen_keys.add(record.source_event_key)
+            events.append(record)
+    return events
+
+
 def collect_source(fetcher: RateLimitedFetcher, source: SourceRow) -> list[EventRecord]:
     if source.license_status != "none" or source.access_model == "license_required":
         log.info("catalog only (no scrape): %s", source.slug)
@@ -587,17 +764,21 @@ def collect_source(fetcher: RateLimitedFetcher, source: SourceRow) -> list[Event
         return collect_nyc_evictions(fetcher, source)
     if source.source_kind == "edgar" and source.slug == "sec-edgar-8k-103":
         return collect_edgar_8k(fetcher, source)
+    if source.slug == "franklin_county_clerk_oh":
+        return collect_fcmc_fed(fetcher, source)
     log.info("no collector for source %s", source.slug)
     return []
 
 
-def collect_once() -> dict[str, int]:
+def collect_once(only_slug: str | None = None) -> dict[str, int]:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     fetcher = RateLimitedFetcher()
     stats = {"sources": 0, "candidates": 0, "inserted": 0}
     try:
         with connect() as conn:
             sources = load_approved_sources(conn)
+            if only_slug:
+                sources = [s for s in sources if s.slug == only_slug]
             stats["sources"] = len(sources)
             for source in sources:
                 records = collect_source(fetcher, source)
@@ -635,7 +816,16 @@ async def run_collector_loop(stop: asyncio.Event) -> None:
 
 
 def main() -> None:
-    collect_once()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="CRE Public Notice Signals collector")
+    parser.add_argument(
+        "--only-slug",
+        default=None,
+        help="Collect a single approved source slug (e.g. franklin_county_clerk_oh)",
+    )
+    args = parser.parse_args()
+    collect_once(only_slug=args.only_slug)
 
 
 if __name__ == "__main__":
