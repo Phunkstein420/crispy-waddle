@@ -20,3 +20,5 @@ services:
         sync: false
       - key: RAPIDAPI_PROXY_SECRET
         sync: false
+      - key: API_KEY
+        sync: false

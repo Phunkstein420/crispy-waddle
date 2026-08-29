@@ -1,12 +1,14 @@
 """CRE Public Notice Signals API.
 
 GET /v1/events, GET /v1/events/{id}, GET /v1/sources
-Honors X-RapidAPI-Proxy-Secret when RAPIDAPI_PROXY_SECRET is set.
+Honors X-RapidAPI-Proxy-Secret when RAPIDAPI_PROXY_SECRET is set,
+and X-Api-Key when API_KEY is set.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -31,17 +33,32 @@ def proxy_secret() -> str:
     return os.getenv("RAPIDAPI_PROXY_SECRET", "").strip()
 
 
+def api_key() -> str:
+    return os.getenv("API_KEY", "").strip()
+
+
+def _header_matches(received: str | None, expected: str) -> bool:
+    if not expected or received is None:
+        return False
+    return hmac.compare_digest(received.encode("utf-8"), expected.encode("utf-8"))
+
+
 async def check_rapidapi_proxy(
     request: Request,
     x_rapidapi_proxy_secret: str | None = Header(default=None, alias="X-RapidAPI-Proxy-Secret"),
+    x_api_key: str | None = Header(default=None, alias="X-Api-Key"),
 ) -> None:
-    expected = proxy_secret()
-    if not expected:
+    expected_proxy = proxy_secret()
+    expected_api_key = api_key()
+    if not expected_proxy and not expected_api_key:
         return
     if request.url.path in PUBLIC_PATHS:
         return
-    if x_rapidapi_proxy_secret != expected:
-        raise HTTPException(status_code=403, detail="Invalid or missing X-RapidAPI-Proxy-Secret")
+    proxy_ok = _header_matches(x_rapidapi_proxy_secret, expected_proxy)
+    api_key_ok = _header_matches(x_api_key, expected_api_key)
+    if proxy_ok or api_key_ok:
+        return
+    raise HTTPException(status_code=403, detail="Invalid or missing origin credentials")
 
 
 def _jsonable(value: Any) -> Any:
