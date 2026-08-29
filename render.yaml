@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: cre-public-notice-signals
+    runtime: python
+    plan: free
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.8"
+      - key: COLLECTOR_ENABLED
+        value: "true"
+      - key: COLLECTOR_INTERVAL_SECONDS
+        value: "21600"
+      - key: DATABASE_URL
+        sync: false
+      - key: CONTACT_EMAIL
+        sync: false
+      - key: RAPIDAPI_PROXY_SECRET
+        sync: false
