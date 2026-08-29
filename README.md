@@ -64,3 +64,17 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
 Supabase tables `public.sources` and `public.events` already exist; this app does not recreate the project.
+
+## Deploy on Render
+
+`render.yaml` defines a Python web service that binds `0.0.0.0:$PORT`. Create it from this repo in workspace `tea-da995d142hec73f5dtmg` (My Workspace):
+
+https://dashboard.render.com/blueprint/new?repo=https://github.com/Phunkstein420/crispy-waddle
+
+Set these env vars in the Dashboard (do not commit them):
+
+- `DATABASE_URL` — Supabase pooler URI for the app role
+- `CONTACT_EMAIL` — used in the SEC.gov User-Agent
+- `RAPIDAPI_PROXY_SECRET` — optional; when set, `/v1/*` requires `X-RapidAPI-Proxy-Secret`
+
+This project does not publish a RapidAPI listing.
